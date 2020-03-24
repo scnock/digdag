@@ -1,11 +1,16 @@
 package io.digdag.core.schedule;
 
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.Map;
 import java.time.ZoneId;
 import com.google.inject.Inject;
 import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableMap;
+import io.digdag.core.agent.CheckedConfig;
+import io.digdag.core.agent.EditDistance;
 import io.digdag.spi.Scheduler;
 import io.digdag.spi.SchedulerFactory;
 import io.digdag.client.config.Config;
@@ -14,6 +19,9 @@ import io.digdag.core.repository.Revision;
 import io.digdag.core.repository.WorkflowDefinition;
 import io.digdag.core.repository.StoredWorkflowDefinition;
 import io.digdag.core.repository.StoredWorkflowDefinitionWithProject;
+import io.digdag.util.DurationParam;
+
+import static io.digdag.core.schedule.ScheduleExecutor.BUILT_IN_SCHEDULE_PARAMS;
 
 public class SchedulerManager
 {
@@ -62,7 +70,11 @@ public class SchedulerManager
 
     private Scheduler getScheduler(Config schedulerConfig, ZoneId workflowTimeZone)
     {
-        Config c = schedulerConfig.deepCopy();
+        Set<String> shouldBeUsedKeys = new HashSet<>(schedulerConfig.getKeys());
+        // Track accessed keys using UsedKeysSet class
+        CheckedConfig.UsedKeysSet usedKeys = new CheckedConfig.UsedKeysSet();
+
+        Config c = new CheckedConfig(schedulerConfig, usedKeys);
 
         String type;
         if (c.has("_type")) {
@@ -82,10 +94,47 @@ public class SchedulerManager
             c.set("_command", command);
         }
 
+        for(String param : BUILT_IN_SCHEDULE_PARAMS){
+            if (param.equals("skip_on_overtime"))
+                c.get("skip_on_overtime", boolean.class, false);
+            else if (param.equals("skip_delayed_by"))
+                c.getOptional("skip_delayed_by", DurationParam.class);
+        }
+
         SchedulerFactory factory = types.get(type);
         if (factory == null) {
             throw new ConfigException("Unknown scheduler type: " + type);
         }
+
+        if (!usedKeys.isAllUsed()) {
+            shouldBeUsedKeys.removeAll(usedKeys);
+            if (!shouldBeUsedKeys.isEmpty()) {
+                warnUnusedKeys(shouldBeUsedKeys, usedKeys);
+            }
+        }
+
         return factory.newScheduler(c, workflowTimeZone);
+    }
+
+    private void warnUnusedKeys(Set<String> shouldBeUsedButNotUsedKeys, Collection<String> candidateKeys)
+    {
+        // throw for only first unused key
+        for (String key : shouldBeUsedButNotUsedKeys) {
+            StringBuilder buf = new StringBuilder();
+            buf.append("Parameter '");
+            buf.append(key);
+            buf.append("' is not used at schedule. ");
+
+            List<String> suggestions = EditDistance.suggest(key, candidateKeys, 0.50);
+            if (suggestions.isEmpty()) {
+                throw new ConfigException(buf.toString());
+            }
+            else {
+                buf.append("> Did you mean '");
+                buf.append(suggestions);
+                buf.append("'");
+                throw new ConfigException(buf.toString());
+            }
+        }
     }
 }
